@@ -3,74 +3,34 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AJO Contact History Query Builder</title>
+  <title>AJO Contact History Audience Builder — V2.1</title>
   <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
   <style>
-    * {
-      margin: 0;
-      padding: 0;
-      box-sizing: border-box;
-    }
-    
-    html, body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Roboto", "Oxygen",
-        "Ubuntu", "Cantarell", "Fira Sans", "Droid Sans", "Helvetica Neue",
-        sans-serif;
-      -webkit-font-smoothing: antialiased;
-      -moz-osx-font-smoothing: grayscale;
-      background: #0a0e17;
-      color: #c8d6e5;
-      line-height: 1.5;
-    }
-    
-    #root {
-      width: 100%;
-      min-height: 100vh;
-      background: #0a0e17;
-    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Roboto", "Oxygen", "Ubuntu", "Cantarell", sans-serif; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; background: #0a0e17; color: #c8d6e5; line-height: 1.5; }
+    #root { width: 100%; min-height: 100vh; background: #0a0e17; }
   </style>
 </head>
 <body>
   <div id="root"></div>
 
   <script type="text/babel">
-    // ─── RESEARCH DATA (verified against Adobe Experience League + XDM GitHub) ───
-    const RESEARCH = {
-      joinKeys: {
-        primary: "AE._experience.customerJourneyManagement.entities.channelDetails.messageID = MF._experience.customerJourneyManagement.messageExecution.messageID",
-        note: "messageID is the canonical join key between ajo_entity_dataset and ajo_message_feedback_event_dataset (per Adobe official query examples).",
-        dedup: "For batch journeys, combine journeyVersionID + journeyActionID + batchInstanceID for uniqueness.",
-      },
-      channels: {
-        email: "https://ns.adobe.com/xdm/channels/email",
-        push: "https://ns.adobe.com/xdm/channels/push",
-        sms: "https://ns.adobe.com/xdm/channels/sms",
-        directMail: "https://ns.adobe.com/xdm/channels/directMail",
-      },
-      feedbackStatuses: ["sent", "bounce", "delay", "error", "exclude", "delivered", "retry"],
-      exclusionCodes: {
-        ExperimentationHoldoutExclusion: { code: "050018", desc: "Qualified treatment is Holdout" },
-        ExcludedForControlRules: { code: "050002", desc: "Violation of control rules (e.g. frequency cap)" },
-        EmailNoMessageFoundForTreatment: { code: "050027", desc: "Experiment enabled, no message for qualified treatment" },
-      },
-      entityExperimentFields: {
-        treatmentID: "_experience.customerJourneyManagement.entities.experiment.treatmentID",
-        experimentId: "_experience.customerJourneyManagement.entities.experiment.experimentId",
-        experimentName: "_experience.customerJourneyManagement.entities.experiment.experimentName",
-        treatmentName: "_experience.customerJourneyManagement.entities.experiment.treatmentName",
-      },
-      entityChannelFields: {
-        variantID: "_experience.customerJourneyManagement.entities.channelDetails.variantID",
-        variantName: "_experience.customerJourneyManagement.entities.channelDetails.variantName",
-        isMultiVariant: "_experience.customerJourneyManagement.entities.channelDetails.isMultiVariant",
-        channel_id: "_experience.customerJourneyManagement.entities.channelDetails.channel._id",
-      },
-      feedbackExclusionField: "_experience.customerJourneyManagement.messageDeliveryfeedback.messageExclusion.reason",
-    };
+    // ═══════════════════════════════════════════════════════════════
+    // AJO CONTACT HISTORY AUDIENCE BUILDER — V2.1
+    // Production-validated SQL for AEP Query Service (Spark SQL)
+    //
+    // CORRECTIONS from production testing:
+    // 1. UNNEST → COALESCE + array index on identityMap
+    // 2. Added isTestExecution IS NULL filter
+    // 3. Added messageID IS NOT NULL guard
+    // 4. Journey/campaign name matching uses LIKE (exact = fails)
+    // 5. Treatment names are user input (not hardcoded A/B)
+    // 6. Removed non-existent campaign.campaignActionName
+    // 7. Flat query (no subquery-then-unnest)
+    // ═══════════════════════════════════════════════════════════════
 
-    // ─── CHANNEL + FLAVOR MAPS ───
     const CHANNEL_MAP = {
       EM: { label: "Email", uri: "https://ns.adobe.com/xdm/channels/email" },
       PU: { label: "Push", uri: "https://ns.adobe.com/xdm/channels/push" },
@@ -79,201 +39,143 @@
     };
 
     const FLAVOR_MAP = {
-      target: { label: "Target", filter: "sent", desc: "Successfully sent messages" },
-      control: { label: "Control (Holdout)", filter: "exclude_holdout", desc: "ExperimentationHoldoutExclusion exclusions" },
-      experiment_A: { label: "Experiment Variant A", filter: "experiment", desc: "Specific treatment variant" },
-      experiment_B: { label: "Experiment Variant B", filter: "experiment", desc: "Specific treatment variant" },
-      all_sent: { label: "All Sent", filter: "sent", desc: "All sent regardless of variant" },
+      target: { label: "Target (Sent)", desc: "Profiles who received the message" },
+      holdout: { label: "Control / Holdout", desc: "ExperimentationHoldoutExclusion (050018)" },
+      variant: { label: "Experiment Variant", desc: "Specific treatment — enter name below" },
+      all_sent: { label: "All Sent", desc: "All sent, any variant" },
+      bounced: { label: "Bounced", desc: "Delivery bounced" },
     };
 
     const SOURCE_MAP = {
-      journey: "Journey",
-      campaign: "Campaign",
+      journey: { label: "Journey", nameField: "entities.journey.journeyName", versionField: "entities.journey.journeyVersionID", hasAction: true, actionField: "entities.journey.journeyActionName" },
+      campaign: { label: "Campaign", nameField: "entities.campaign.name", versionField: "entities.campaign.campaignVersionID", hasAction: false },
     };
 
-    // ─── SQL GENERATOR ───
-    function generateSQL({ source, channel, flavor, dateFrom, dateTo, journeyName, audienceName, identityNs }) {
-      const ch = CHANNEL_MAP[channel];
-      const fl = FLAVOR_MAP[flavor];
-      const isJourney = source === "journey";
-      const aud = audienceName || "contact_history_audience";
-      const ns = identityNs || "vtflPartnerid";
+    const EXCLUSION_CODES = [
+      { code: "050018", name: "ExperimentationHoldoutExclusion", desc: "Holdout arm of experiment" },
+      { code: "050002", name: "ExcludedForControlRules", desc: "Frequency cap / control rule" },
+      { code: "050027", name: "EmailNoMessageFoundForTreatment", desc: "No email message for treatment" },
+      { code: "050036", name: "PushNoMessageFoundForTreatment", desc: "No push message for treatment" },
+      { code: "050017", name: "ExperimentNamespaceMismatch", desc: "Namespace mismatch" },
+    ];
 
-      // Build WHERE clauses
-      const wheres = [];
-      wheres.push(`  AE._experience.customerJourneyManagement.entities.channelDetails.channel._id = '${ch.uri}'`);
+    const FEEDBACK_STATUSES = ["sent", "bounce", "delay", "error", "exclude", "delivered", "retry"];
+    const P = "_experience.customerJourneyManagement";
 
-      if (isJourney) {
-        wheres.push(`  AE._experience.customerJourneyManagement.entities.journey.journeyVersionID IS NOT NULL`);
-        if (journeyName) {
-          wheres.push(`  AE._experience.customerJourneyManagement.entities.journey.journeyName = '${journeyName}'`);
-        }
-      } else {
-        wheres.push(`  AE._experience.customerJourneyManagement.entities.campaign.campaignVersionID IS NOT NULL`);
-        if (journeyName) {
-          wheres.push(`  AE._experience.customerJourneyManagement.entities.campaign.name = '${journeyName}'`);
-        }
-      }
-
-      // Flavor-specific WHERE
-      if (flavor === "target" || flavor === "all_sent") {
-        wheres.push(`  MF._experience.customerJourneyManagement.messageDeliveryfeedback.feedbackStatus = 'sent'`);
-      } else if (flavor === "control") {
-        wheres.push(`  MF._experience.customerJourneyManagement.messageDeliveryfeedback.feedbackStatus = 'exclude'`);
-        wheres.push(`  MF._experience.customerJourneyManagement.messageDeliveryfeedback.messageExclusion.reason = 'ExperimentationHoldoutExclusion'`);
-      } else if (flavor.startsWith("experiment")) {
-        wheres.push(`  MF._experience.customerJourneyManagement.messageDeliveryfeedback.feedbackStatus = 'sent'`);
-        wheres.push(`  AE._experience.customerJourneyManagement.entities.experiment.treatmentName IS NOT NULL`);
-        const variant = flavor === "experiment_A" ? "Treatment A" : "Treatment B";
-        wheres.push(`  AE._experience.customerJourneyManagement.entities.experiment.treatmentName = '${variant}'`);
-      }
-
-      if (dateFrom) wheres.push(`  MF.timestamp >= '${dateFrom}T00:00:00.000Z'`);
-      if (dateTo) wheres.push(`  MF.timestamp <= '${dateTo}T23:59:59.999Z'`);
-
-      // Journey-specific SELECT fields
-      const nameField = isJourney
-        ? `AE._experience.customerJourneyManagement.entities.journey.journeyName`
-        : `AE._experience.customerJourneyManagement.entities.campaign.name`;
-      const actionField = isJourney
-        ? `AE._experience.customerJourneyManagement.entities.journey.journeyActionName`
-        : `AE._experience.customerJourneyManagement.entities.campaign.campaignActionName`;
-      const versionField = isJourney
-        ? `AE._experience.customerJourneyManagement.entities.journey.journeyVersionID`
-        : `AE._experience.customerJourneyManagement.entities.campaign.campaignVersionID`;
-
-      const selectQuery = `SELECT
-    MF._experience.customerJourneyManagement.messageExecution.messageID    AS message_id,
-    ${nameField}                                                           AS ${isJourney ? "journey_name" : "campaign_name"},
-    ${actionField}                                                         AS action_name,
-    ${versionField}                                                        AS version_id,
-    AE._experience.customerJourneyManagement.entities.experiment.experimentName   AS experiment_name,
-    AE._experience.customerJourneyManagement.entities.experiment.treatmentName    AS treatment_name,
-    AE._experience.customerJourneyManagement.entities.channelDetails.variantName  AS variant_name,
-    MF._experience.customerJourneyManagement.messageDeliveryfeedback.feedbackStatus AS feedback_status,
-    MF._experience.customerJourneyManagement.messageProfile.channel._id    AS channel,
-    MF.timestamp                                                           AS event_timestamp,
-    MF._experience.customerJourneyManagement.messageExecution.journeyVersionID   AS mf_journey_version_id,
-    MF._experience.customerJourneyManagement.messageExecution.batchInstanceID    AS batch_instance_id,
-    MF.identityMap                                                         AS identity_map
-  FROM ajo_entity_dataset AE
-  INNER JOIN ajo_message_feedback_event_dataset MF
-    ON AE._experience.customerJourneyManagement.entities.channelDetails.messageID
-       = MF._experience.customerJourneyManagement.messageExecution.messageID
-  WHERE
-${wheres.join("\n  AND\n")}`;
-
-      // Data Distiller audience wrapper
-      const audienceSQL = `-- ═══════════════════════════════════════════════════════════
--- DATA DISTILLER AUDIENCE: ${aud}
--- Source: ${SOURCE_MAP[source]} | Channel: ${ch.label} | Flavor: ${fl.label}
--- Generated: ${new Date().toISOString().split("T")[0]}
--- ═══════════════════════════════════════════════════════════
-
--- STEP 1: Create the audience (run once)
-CREATE AUDIENCE ${aud}
-WITH (primary_identity='${ns}', identity_namespace='${ns}')
-AS (
-  SELECT DISTINCT
-    -- Extract primary identity from identityMap
-    -- Adjust the namespace key below to match your environment
-    identity_entry.id AS ${ns}
-  FROM (
-    ${selectQuery.split("\n").map(l => "    " + l).join("\n")}
-  ) base,
-  UNNEST(base.identity_map['${ns}']) AS identity_entry
-);
-
--- STEP 2: Refresh the audience (schedule this query)
--- INSERT OVERWRITE INTO ${aud}
--- SELECT DISTINCT identity_entry.id AS ${ns}
--- FROM ( ... same SELECT ... ) base,
--- UNNEST(base.identity_map['${ns}']) AS identity_entry;
-
--- ═══════════════════════════════════════════════════════════
--- NOTES:
--- • Data Distiller audiences expire after 30 days (external audiences).
--- • Use INSERT OVERWRITE INTO for scheduled refreshes.
--- • batchInstanceID distinguishes runs of batch journeys.
--- • Timestamps are in UTC in the feedback dataset.
--- ═══════════════════════════════════════════════════════════`;
-
-      return { selectQuery, audienceSQL };
+    function identitySelect(ns) {
+      return `COALESCE(\n        MF.identityMap['${ns}'][0].id,\n        MF.identityMap['${ns.toLowerCase()}'][0].id\n    ) AS partner_id`;
     }
 
-    // ─── UI COMPONENT ───
-    function AJOQueryGenerator() {
+    function generateSQL(config) {
+      const { source, channel, flavor, entityName, audienceName, identityNs, dateFrom, dateTo, treatmentName, queryType } = config;
+      const ch = CHANNEL_MAP[channel];
+      const src = SOURCE_MAP[source];
+      const ns = identityNs || "vtflPartnerid";
+      const aud = audienceName || "contact_history_audience";
+
+      const wheres = [];
+      wheres.push(`    -- Filter: exclude test/seed executions\n    MF.${P}.messageProfile.isTestExecution IS NULL`);
+      wheres.push(`    -- Filter: guard against null messageID joins\n    MF.${P}.messageExecution.messageID IS NOT NULL`);
+      wheres.push(`    AE.${P}.entities.channelDetails.channel._id\n      = '${ch.uri}'`);
+      wheres.push(`    AE.${P}.${src.versionField} IS NOT NULL`);
+      if (entityName) {
+        wheres.push(`    -- LIKE used because exact match (=) is unreliable in AJO Entity Dataset\n    AE.${P}.${src.nameField}\n      LIKE '%${entityName}%'`);
+      }
+      if (flavor === "target" || flavor === "all_sent") {
+        wheres.push(`    MF.${P}.messageDeliveryfeedback.feedbackStatus = 'sent'`);
+      } else if (flavor === "holdout") {
+        wheres.push(`    MF.${P}.messageDeliveryfeedback.feedbackStatus = 'exclude'`);
+        wheres.push(`    MF.${P}.messageDeliveryfeedback.messageExclusion.reason = 'ExperimentationHoldoutExclusion'`);
+      } else if (flavor === "variant") {
+        wheres.push(`    MF.${P}.messageDeliveryfeedback.feedbackStatus = 'sent'`);
+        wheres.push(`    AE.${P}.entities.experiment.treatmentName IS NOT NULL`);
+        if (treatmentName) wheres.push(`    AE.${P}.entities.experiment.treatmentName = '${treatmentName}'`);
+      } else if (flavor === "bounced") {
+        wheres.push(`    MF.${P}.messageDeliveryfeedback.feedbackStatus = 'bounce'`);
+      }
+      if (dateFrom) wheres.push(`    MF.timestamp >= '${dateFrom}T00:00:00.000Z'`);
+      if (dateTo) wheres.push(`    MF.timestamp <= '${dateTo}T23:59:59.999Z'`);
+      if (!dateFrom && !dateTo) wheres.push(`    MF.timestamp >= CURRENT_DATE - INTERVAL '90' DAY`);
+
+      const whereClause = wheres.join("\n    AND ");
+      const joinBlock = `FROM ajo_entity_dataset AE\nINNER JOIN ajo_message_feedback_event_dataset MF\n    ON AE.${P}.entities.channelDetails.messageID\n     = MF.${P}.messageExecution.messageID\nWHERE\n${whereClause}`;
+
+      if (queryType === "discovery") {
+        return `-- DISCOVERY: What journeys/campaigns/treatments exist?\nSELECT\n    AE.${P}.entities.journey.journeyName         AS journey_name,\n    AE.${P}.entities.journey.journeyActionName    AS action_name,\n    AE.${P}.entities.channelDetails.channel._id   AS channel,\n    AE.${P}.entities.experiment.experimentName    AS experiment,\n    AE.${P}.entities.experiment.treatmentName     AS treatment,\n    COUNT(DISTINCT AE.${P}.entities.channelDetails.messageID) AS message_count\nFROM ajo_entity_dataset AE\nWHERE\n    AE.${P}.entities.journey.journeyVersionID IS NOT NULL\n    AND AE.${P}.entities.journey.journeyName IS NOT NULL\nGROUP BY 1, 2, 3, 4, 5\nORDER BY message_count DESC;`;
+      }
+
+      if (queryType === "exploratory") {
+        const nameAlias = source === "journey" ? "journey_name" : "campaign_name";
+        const cols = [`    AE.${P}.${src.nameField}  AS ${nameAlias}`];
+        if (src.hasAction) cols.push(`    AE.${P}.${src.actionField}  AS action_name`);
+        cols.push(
+          `    AE.${P}.entities.experiment.experimentName   AS experiment_name`,
+          `    AE.${P}.entities.experiment.treatmentName     AS treatment_name`,
+          `    AE.${P}.entities.channelDetails.variantName   AS variant_name`,
+          `    MF.${P}.messageDeliveryfeedback.feedbackStatus AS feedback_status`,
+          `    MF.timestamp AS event_timestamp`,
+          `    MF.${P}.messageExecution.batchInstanceID AS batch_id`,
+        );
+        return `-- EXPLORATORY: ${src.label} | ${ch.label} | ${FLAVOR_MAP[flavor].label}\n-- Generated: ${new Date().toISOString().split("T")[0]}\n\nSELECT\n${cols.join(",\n")},\n    ${identitySelect(ns)},\n    COUNT(*) AS cnt\n${joinBlock}\nGROUP BY ${Array.from({length: cols.length + 1}, (_, i) => i + 1).join(", ")}\nORDER BY cnt DESC\nLIMIT 200;`;
+      }
+
+      // Audience query
+      const header = `-- DATA DISTILLER AUDIENCE: ${aud}\n-- ${src.label} | ${ch.label} | ${FLAVOR_MAP[flavor].label}\n-- Generated: ${new Date().toISOString().split("T")[0]}`;
+      const sel = `SELECT DISTINCT\n    ${identitySelect(ns)}`;
+      const stmt = `CREATE AUDIENCE ${aud}\n    AS (\n${sel}\n${joinBlock}\n    )\nWITH (primary_identity='${ns}')`;
+      const refresh = `-- REFRESH (schedule < 30 days):\n-- INSERT OVERWRITE INTO ${aud}\n-- ${sel}\n-- ${joinBlock};`;
+      return `${header}\n\n${stmt};\n\n${refresh}`;
+    }
+
+    function App() {
       const [source, setSource] = React.useState("journey");
       const [channel, setChannel] = React.useState("EM");
       const [flavor, setFlavor] = React.useState("target");
-      const [dateFrom, setDateFrom] = React.useState("");
-      const [dateTo, setDateTo] = React.useState("");
-      const [journeyName, setJourneyName] = React.useState("");
+      const [entityName, setEntityName] = React.useState("");
       const [audienceName, setAudienceName] = React.useState("");
       const [identityNs, setIdentityNs] = React.useState("vtflPartnerid");
-      const [activeTab, setActiveTab] = React.useState("generator");
-      const [copied, setCopied] = React.useState(false);
-      const codeRef = React.useRef(null);
+      const [dateFrom, setDateFrom] = React.useState("");
+      const [dateTo, setDateTo] = React.useState("");
+      const [treatmentName, setTreatmentName] = React.useState("");
+      const [queryType, setQueryType] = React.useState("audience");
+      const [activeTab, setActiveTab] = React.useState("query");
+      const [copied, setCopied] = React.useState("");
 
-      const { selectQuery, audienceSQL } = generateSQL({
-        source, channel, flavor, dateFrom, dateTo, journeyName, audienceName, identityNs,
-      });
+      const sql = generateSQL({ source, channel, flavor, entityName, audienceName, identityNs, dateFrom, dateTo, treatmentName, queryType });
 
-      const handleCopy = (text) => {
+      const handleCopy = (text, id) => {
         navigator.clipboard.writeText(text).then(() => {
-          setCopied(true);
-          setTimeout(() => setCopied(false), 2000);
+          setCopied(id);
+          setTimeout(() => setCopied(""), 2000);
         });
       };
 
+      const C = { bg: "#0a0e17", card: "#131b2e", border: "#1e2d4a", bright: "#e8f0fe", muted: "#5a7a9a", blue: "#8ab4d8", green: "#75e6a0", red: "#e67575", amber: "#e6c875" };
+
       return (
-        <div style={{
-          minHeight: "100vh",
-          background: "#0a0e17",
-          color: "#c8d6e5",
-          padding: "20px",
-        }}>
+        <div style={{ minHeight: "100vh", background: C.bg, color: "#c8d6e5", padding: 20 }}>
           <div style={{ maxWidth: 1400, margin: "0 auto" }}>
             {/* Header */}
-            <div style={{
-              marginBottom: 40,
-              paddingBottom: 20,
-              borderBottom: "1px solid #1e2d4a",
-            }}>
-              <h1 style={{
-                fontSize: 32,
-                fontWeight: 700,
-                color: "#e8f0fe",
-                marginBottom: 4,
-              }}>
-                AJO Contact History Query Builder
+            <div style={{ marginBottom: 40, paddingBottom: 20, borderBottom: `1px solid ${C.border}` }}>
+              <h1 style={{ fontSize: 32, fontWeight: 700, color: C.bright, marginBottom: 4 }}>
+                AJO Contact History Audience Builder
               </h1>
-              <p style={{
-                fontSize: 13,
-                color: "#5a7a9a",
-                marginTop: 8,
-                fontWeight: 500,
-              }}>
-                DATA DISTILLER • QUERY SERVICE • PHASE 1+
+              <p style={{ fontSize: 13, color: C.muted, marginTop: 8, fontWeight: 500 }}>
+                V2.1 • Production-Validated • Query Service (Spark SQL)
               </p>
             </div>
 
             {/* Tabs */}
-            <div style={{
-              display: "flex",
-              gap: 8,
-              marginBottom: 24,
-              borderBottom: "1px solid #1e2d4a",
-            }}>
-              {["generator", "research"].map(tab => (
+            <div style={{ display: "flex", gap: 8, marginBottom: 24, borderBottom: `1px solid ${C.border}` }}>
+              {["query", "discovery", "exploration", "guide", "reference"].map(tab => (
                 <button
                   key={tab}
                   onClick={() => setActiveTab(tab)}
                   style={{
                     padding: "10px 16px",
-                    background: activeTab === tab ? "#131b2e" : "transparent",
-                    color: activeTab === tab ? "#e8f0fe" : "#4a6a8a",
-                    border: activeTab === tab ? "1px solid #2a4a6a" : "none",
+                    background: activeTab === tab ? C.card : "transparent",
+                    color: activeTab === tab ? C.bright : "#4a6a8a",
+                    border: activeTab === tab ? `1px solid #2a4a6a` : "none",
                     borderRadius: "4px 4px 0 0",
                     cursor: "pointer",
                     fontSize: 13,
@@ -287,149 +189,93 @@ AS (
               ))}
             </div>
 
-            {/* GENERATOR TAB */}
-            {activeTab === "generator" && (
-              <div style={{ display: "grid", gridTemplateColumns: "350px 1fr", gap: 24 }}>
-                {/* Controls Panel */}
-                <div style={{
-                  background: "#131b2e",
-                  border: "1px solid #1e2d4a",
-                  borderRadius: 8,
-                  padding: 20,
-                  height: "fit-content",
-                  position: "sticky",
-                  top: 20,
-                }}>
-                  <h2 style={{ fontSize: 14, color: "#e8f0fe", marginBottom: 20, fontWeight: 700 }}>
-                    CONFIGURATION
-                  </h2>
+            {/* QUERY TAB */}
+            {activeTab === "query" && (
+              <div style={{ display: "grid", gridTemplateColumns: "340px 1fr", gap: 24 }}>
+                <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 8, padding: 20, height: "fit-content", position: "sticky", top: 20 }}>
+                  <h2 style={{ fontSize: 14, color: C.bright, marginBottom: 20, fontWeight: 700 }}>CONFIGURATION</h2>
 
-                  <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-                    {/* Source */}
+                  <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
                     <div>
                       <Label>Source</Label>
                       <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
                         {["journey", "campaign"].map(s => (
-                          <Pill
-                            key={s}
-                            active={source === s}
-                            onClick={() => setSource(s)}
-                            wide
-                          >
-                            {SOURCE_MAP[s]}
+                          <Pill key={s} active={source === s} onClick={() => setSource(s)} wide>
+                            {SOURCE_MAP[s].label}
                           </Pill>
                         ))}
                       </div>
                     </div>
 
-                    {/* Channel */}
                     <div>
                       <Label>Channel</Label>
                       <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 8 }}>
                         {Object.entries(CHANNEL_MAP).map(([code, ch]) => (
-                          <Pill
-                            key={code}
-                            active={channel === code}
-                            onClick={() => setChannel(code)}
-                            wide
-                          >
+                          <Pill key={code} active={channel === code} onClick={() => setChannel(code)} wide>
                             {ch.label}
                           </Pill>
                         ))}
                       </div>
                     </div>
 
-                    {/* Flavor */}
                     <div>
                       <Label>Flavor</Label>
                       <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 8 }}>
                         {Object.entries(FLAVOR_MAP).map(([key, fl]) => (
-                          <Pill
-                            key={key}
-                            active={flavor === key}
-                            onClick={() => setFlavor(key)}
-                            wide
-                          >
+                          <Pill key={key} active={flavor === key} onClick={() => setFlavor(key)} wide>
                             {fl.label}
                           </Pill>
                         ))}
                       </div>
-                    </div>
-
-                    {/* Dates */}
-                    <div>
-                      <Label>From (YYYY-MM-DD)</Label>
-                      <Input
-                        type="date"
-                        value={dateFrom}
-                        onChange={e => setDateFrom(e.target.value)}
-                        style={{ marginTop: 6 }}
-                      />
+                      {flavor === "variant" && (
+                        <>
+                          <Label style={{ marginTop: 12 }}>Treatment Name</Label>
+                          <Input placeholder="e.g. Treatment A" value={treatmentName} onChange={e => setTreatmentName(e.target.value)} />
+                          <Hint>Run Discovery query to see available treatments</Hint>
+                        </>
+                      )}
                     </div>
 
                     <div>
-                      <Label>To (YYYY-MM-DD)</Label>
-                      <Input
-                        type="date"
-                        value={dateTo}
-                        onChange={e => setDateTo(e.target.value)}
-                        style={{ marginTop: 6 }}
-                      />
+                      <Label>{source === "journey" ? "Journey Name (partial)" : "Campaign Name (partial)"}</Label>
+                      <Input placeholder="e.g. Welcome" value={entityName} onChange={e => setEntityName(e.target.value)} />
+                      <Hint>Uses LIKE '%name%' matching</Hint>
                     </div>
 
-                    {/* Journey/Campaign Name */}
-                    <div>
-                      <Label>{source === "journey" ? "Journey Name" : "Campaign Name"}</Label>
-                      <Input
-                        type="text"
-                        placeholder="e.g. Renewal Reminder"
-                        value={journeyName}
-                        onChange={e => setJourneyName(e.target.value)}
-                        style={{ marginTop: 6 }}
-                      />
-                    </div>
-
-                    {/* Audience Name */}
                     <div>
                       <Label>Audience Name</Label>
-                      <Input
-                        type="text"
-                        placeholder="contact_history_audience"
-                        value={audienceName}
-                        onChange={e => setAudienceName(e.target.value)}
-                        style={{ marginTop: 6 }}
-                      />
+                      <Input placeholder="contact_history_audience" value={audienceName} onChange={e => setAudienceName(e.target.value)} />
                     </div>
 
-                    {/* Identity Namespace */}
                     <div>
                       <Label>Identity Namespace</Label>
-                      <Input
-                        type="text"
-                        placeholder="vtflPartnerid"
-                        value={identityNs}
-                        onChange={e => setIdentityNs(e.target.value)}
-                        style={{ marginTop: 6 }}
-                      />
+                      <Input placeholder="vtflPartnerid" value={identityNs} onChange={e => setIdentityNs(e.target.value)} />
+                    </div>
+
+                    <div>
+                      <Label>Date From</Label>
+                      <Input type="date" value={dateFrom} onChange={e => setDateFrom(e.target.value)} />
+                      <Hint>Default: last 90 days if blank</Hint>
+                    </div>
+
+                    <div>
+                      <Label>Date To</Label>
+                      <Input type="date" value={dateTo} onChange={e => setDateTo(e.target.value)} />
                     </div>
                   </div>
                 </div>
 
-                {/* Output Panel */}
                 <div>
-                  {/* SELECT Query */}
                   <div style={{ marginBottom: 32 }}>
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-                      <h2 style={{ fontSize: 14, color: "#e8f0fe", fontWeight: 700 }}>
-                        SELECT QUERY
-                      </h2>
+                      <h2 style={{ fontSize: 14, color: C.bright, fontWeight: 700 }}>GENERATED SQL</h2>
                       <button
-                        onClick={() => handleCopy(selectQuery)}
+                        onClick={() => handleCopy(sql, "sql")}
                         style={{
                           padding: "6px 12px",
-                          background: copied ? "#75e6a0" : "#1a3a2a",
-                          color: copied ? "#0a0e17" : "#75e6a0",
-                          border: "1px solid #2a5a4a",
+                          background: copied === "sql" ? C.green : "#1a3a2a",
+                          color: copied === "sql" ? "#0a0e17" : C.green,
+                          border: `1px solid #2a5a4a`,
                           borderRadius: 4,
                           cursor: "pointer",
                           fontSize: 11,
@@ -437,123 +283,167 @@ AS (
                           transition: "all 0.2s ease",
                         }}
                       >
-                        {copied ? "✓ Copied" : "Copy"}
+                        {copied === "sql" ? "✓ Copied" : "Copy"}
                       </button>
                     </div>
-                    <Code>{selectQuery}</Code>
-                  </div>
-
-                  {/* Audience SQL */}
-                  <div>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-                      <h2 style={{ fontSize: 14, color: "#e8f0fe", fontWeight: 700 }}>
-                        DATA DISTILLER AUDIENCE SQL
-                      </h2>
-                      <button
-                        onClick={() => handleCopy(audienceSQL)}
-                        style={{
-                          padding: "6px 12px",
-                          background: copied ? "#75e6a0" : "#1a3a2a",
-                          color: copied ? "#0a0e17" : "#75e6a0",
-                          border: "1px solid #2a5a4a",
-                          borderRadius: 4,
-                          cursor: "pointer",
-                          fontSize: 11,
-                          fontWeight: 600,
-                          transition: "all 0.2s ease",
-                        }}
-                      >
-                        {copied ? "✓ Copied" : "Copy"}
-                      </button>
-                    </div>
-                    <Code>{audienceSQL}</Code>
+                    <Code>{sql}</Code>
                   </div>
                 </div>
               </div>
             )}
 
-            {/* RESEARCH TAB */}
-            {activeTab === "research" && (
-              <div style={{ display: "flex", flexDirection: "column", gap: 24 }}>
-                <ResearchCard
-                  title="Join Key"
-                  status="verified"
-                >
-                  <p><strong>Primary join:</strong> <code>messageID</code></p>
-                  <p style={{ marginTop: 8 }}>{RESEARCH.joinKeys.note}</p>
-                  <p style={{ marginTop: 8 }}><strong>Dedup note:</strong> {RESEARCH.joinKeys.dedup}</p>
-                </ResearchCard>
-
-                <div style={{ marginTop: 8 }}>
-                  <h2 style={{ fontSize: 16, color: "#e8f0fe", marginBottom: 16, fontWeight: 700 }}>
-                    Feedback Status Values
-                  </h2>
-                  <div style={{
-                    display: "flex", flexWrap: "wrap", gap: 8,
-                  }}>
-                    {RESEARCH.feedbackStatuses.map(s => (
-                      <span key={s} style={{
-                        padding: "4px 12px",
-                        background: "#131b2e",
-                        border: "1px solid #1e2d4a",
+            {/* DISCOVERY TAB */}
+            {activeTab === "discovery" && (
+              <div>
+                <p style={{ color: C.muted, marginBottom: 16 }}>Run this to explore what journeys, campaigns, treatments, and channels exist in your instance:</p>
+                <div style={{ marginBottom: 32 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                    <h2 style={{ fontSize: 14, color: C.bright, fontWeight: 700 }}>DISCOVERY QUERY</h2>
+                    <button
+                      onClick={() => {
+                        const q = generateSQL({ source: "journey", channel: "EM", flavor: "all_sent", queryType: "discovery" });
+                        handleCopy(q, "discovery");
+                      }}
+                      style={{
+                        padding: "6px 12px",
+                        background: copied === "discovery" ? C.green : "#1a3a2a",
+                        color: copied === "discovery" ? "#0a0e17" : C.green,
+                        border: `1px solid #2a5a4a`,
                         borderRadius: 4,
-                        fontSize: 12,
-                        color: s === "sent" ? "#75e6a0" : s === "bounce" ? "#e67575" : s === "exclude" ? "#e6c875" : "#8ab4d8",
+                        cursor: "pointer",
+                        fontSize: 11,
                         fontWeight: 600,
-                      }}>{s}</span>
-                    ))}
+                      }}
+                    >
+                      {copied === "discovery" ? "✓ Copied" : "Copy"}
+                    </button>
                   </div>
+                  <Code>{generateSQL({ source: "journey", channel: "EM", flavor: "all_sent", queryType: "discovery" })}</Code>
                 </div>
+              </div>
+            )}
 
-                <div style={{ marginTop: 32 }}>
-                  <h2 style={{ fontSize: 16, color: "#e8f0fe", marginBottom: 16, fontWeight: 700 }}>
-                    Key Exclusion Codes
-                  </h2>
-                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
-                    <thead>
-                      <tr style={{ borderBottom: "2px solid #1e2d4a" }}>
-                        {["Code", "Reason", "Description"].map(h => (
-                          <th key={h} style={{
-                            textAlign: "left", padding: "10px 12px",
-                            color: "#5a7a9a", fontWeight: 700,
-                            textTransform: "uppercase", letterSpacing: "0.08em", fontSize: 10,
-                          }}>{h}</th>
-                        ))}
+            {/* EXPLORATION TAB */}
+            {activeTab === "exploration" && (
+              <div>
+                <p style={{ color: C.muted, marginBottom: 16 }}>Exploratory query with sample data (limit 200):</p>
+                <div style={{ marginBottom: 32 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+                    <h2 style={{ fontSize: 14, color: C.bright, fontWeight: 700 }}>EXPLORATORY QUERY</h2>
+                    <button
+                      onClick={() => {
+                        const q = generateSQL({ source: "journey", channel: "EM", flavor: "target", queryType: "exploratory" });
+                        handleCopy(q, "exploratory");
+                      }}
+                      style={{
+                        padding: "6px 12px",
+                        background: copied === "exploratory" ? C.green : "#1a3a2a",
+                        color: copied === "exploratory" ? "#0a0e17" : C.green,
+                        border: `1px solid #2a5a4a`,
+                        borderRadius: 4,
+                        cursor: "pointer",
+                        fontSize: 11,
+                        fontWeight: 600,
+                      }}
+                    >
+                      {copied === "exploratory" ? "✓ Copied" : "Copy"}
+                    </button>
+                  </div>
+                  <Code>{generateSQL({ source: "journey", channel: "EM", flavor: "target", queryType: "exploratory" })}</Code>
+                </div>
+              </div>
+            )}
+
+            {/* GUIDE TAB */}
+            {activeTab === "guide" && (
+              <div style={{ maxWidth: 900 }}>
+                <RCard title="1. Start with Discovery" status="verified">
+                  <p>Run the Discovery query to see what journeys, campaigns, treatments, and channels exist in your instance. This tells you which values to use in other queries.</p>
+                </RCard>
+                <RCard title="2. COALESCE Pattern (Production Fix)" status="fix">
+                  <p>First filter excludes test/seed sends. Second prevents false JOIN matches on null messageIDs.</p>
+                </RCard>
+                <RCard title="3. LIKE Matching for Names" status="fix">
+                  <p>Exact match (<code>=</code>) returns 0 rows even for existing journeys. Journey names can contain whitespace/encoding differences. <code>LIKE '%name%'</code> works correctly.</p>
+                </RCard>
+                <RCard title="4. Treatment Names Are Environment-Specific" status="fix">
+                  <p>Not standardized as "Treatment A/B". Run Discovery query to find actual values.</p>
+                </RCard>
+                <RCard title="5. No campaign.campaignActionName Field" status="fix">
+                  <p>This field does not exist. Campaigns have <code>campaign.name</code> and <code>campaign.campaignVersionID</code> only. Action name concept is journey-specific.</p>
+                </RCard>
+                <RCard title="6. Canonical messageID Join" status="verified">
+                  <Code>{`AE...entities.channelDetails.messageID\n = MF...messageExecution.messageID`}</Code>
+                  <p>Each experiment treatment has a unique messageID (XDM confirmed). Batch journeys may need <code>batchInstanceID</code> for disambiguation.</p>
+                </RCard>
+                <RCard title="7. 30-Day TTL on Data Distiller Audiences" status="verified">
+                  <p>Auto-deleted after 30 days. Refresh via <code>INSERT OVERWRITE INTO</code> on schedule shorter than 30 days.</p>
+                </RCard>
+                <RCard title="8. Holdout Detection" status="verified">
+                  <p><code>feedbackStatus = 'exclude'</code> + <code>messageExclusion.reason = 'ExperimentationHoldoutExclusion'</code> (code 050018).</p>
+                </RCard>
+                <RCard title="9. Adobe Docs May Not Work" status="warning">
+                  <p>Several SQL patterns from Experience League fail in AEP Query Service. Always test before production use. Entity dataset has duplicate entries per message (use DISTINCT).</p>
+                </RCard>
+              </div>
+            )}
+
+            {/* REFERENCE TAB */}
+            {activeTab === "reference" && (
+              <div style={{ maxWidth: 900 }}>
+                <h2 style={{ fontSize: 16, color: C.bright, marginBottom: 16, fontWeight: 700 }}>Field Paths</h2>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11.5 }}>
+                  <thead><tr style={{ borderBottom: `2px solid ${C.border}` }}>
+                    {["Field", "Dataset", "Path"].map(h => (<th key={h} style={{ textAlign: "left", padding: "10px 12px", color: C.muted, fontWeight: 700, textTransform: "uppercase", fontSize: 10 }}>{h}</th>))}
+                  </tr></thead>
+                  <tbody>
+                    {[
+                      ["Message ID (entity)", "entity", "...entities.channelDetails.messageID"],
+                      ["Message ID (feedback)", "feedback", "...messageExecution.messageID"],
+                      ["Journey Name", "entity", "...entities.journey.journeyName"],
+                      ["Journey Action", "entity", "...entities.journey.journeyActionName"],
+                      ["Campaign Name", "entity", "...entities.campaign.name"],
+                      ["Channel (entity)", "entity", "...entities.channelDetails.channel._id"],
+                      ["Feedback Status", "feedback", "...messageDeliveryfeedback.feedbackStatus"],
+                      ["Exclusion Reason", "feedback", "...messageDeliveryfeedback.messageExclusion.reason"],
+                      ["Is Test Execution", "feedback", "...messageProfile.isTestExecution"],
+                      ["Batch Instance ID", "feedback", "...messageExecution.batchInstanceID"],
+                      ["Treatment Name", "entity", "...entities.experiment.treatmentName"],
+                      ["Experiment Name", "entity", "...entities.experiment.experimentName"],
+                      ["Variant Name", "entity", "...entities.channelDetails.variantName"],
+                      ["Email Subject", "entity", "...entities.channelDetails.email.subject"],
+                    ].map(([f, d, p], i) => (
+                      <tr key={i} style={{ borderBottom: `1px solid #141e30`, background: i % 2 === 0 ? "transparent" : "#0d1220" }}>
+                        <td style={{ padding: "8px 12px", color: C.bright, fontWeight: 600 }}>{f}</td>
+                        <td style={{ padding: "8px 12px", color: "#5a9a7a" }}>{d}</td>
+                        <td style={{ padding: "8px 12px", color: C.blue, fontSize: 10 }}><code>{p}</code></td>
                       </tr>
-                    </thead>
-                    <tbody>
-                      {Object.entries(RESEARCH.exclusionCodes).map(([name, v], i) => (
-                        <tr key={name} style={{
-                          borderBottom: "1px solid #141e30",
-                          background: i % 2 === 0 ? "transparent" : "#0d1220",
-                        }}>
-                          <td style={{ padding: "8px 12px", color: "#e6c875", fontWeight: 600 }}>{v.code}</td>
-                          <td style={{ padding: "8px 12px", color: "#e8f0fe" }}>{name}</td>
-                          <td style={{ padding: "8px 12px", color: "#8ab4d8" }}>{v.desc}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
+                    ))}
+                  </tbody>
+                </table>
+
+                <h2 style={{ fontSize: 16, color: C.bright, margin: "32px 0 16px", fontWeight: 700 }}>Status Values</h2>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                  {FEEDBACK_STATUSES.map(s => (
+                    <span key={s} style={{ padding: "4px 12px", background: C.card, border: `1px solid ${C.border}`, borderRadius: 4, fontSize: 12, color: s === "sent" ? C.green : s === "bounce" ? C.red : s === "exclude" ? C.amber : C.blue, fontWeight: 600 }}>{s}</span>
+                  ))}
                 </div>
 
-                <div style={{
-                  marginTop: 32,
-                  padding: 16,
-                  background: "#131b2e",
-                  border: "1px solid #1e2d4a",
-                  borderRadius: 8,
-                  fontSize: 11,
-                  color: "#5a7a9a",
-                  lineHeight: 1.7,
-                }}>
-                  <strong style={{ color: "#8ab4d8" }}>Sources verified:</strong>{" "}
-                  Adobe Experience League (Dataset Query Examples, Exclusion List, Data Distiller Audiences),
-                  Adobe XDM GitHub repository (ajo-entity-mixins.schema.json),
-                  Adobe Experience League Community (feedbackStatus enum values),
-                  CJA Integration documentation (field mapping reference).
-                  All field paths use the <code>_experience.customerJourneyManagement</code> prefix which maps to
-                  the XDM namespace <code>https://ns.adobe.com/experience/customerJourneyManagement</code>.
-                </div>
+                <h2 style={{ fontSize: 16, color: C.bright, margin: "32px 0 16px", fontWeight: 700 }}>Exclusion Codes</h2>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                  <thead><tr style={{ borderBottom: `2px solid ${C.border}` }}>
+                    {["Code", "Reason", "Desc"].map(h => (<th key={h} style={{ textAlign: "left", padding: "10px 12px", color: C.muted, fontWeight: 700, fontSize: 10 }}>{h}</th>))}
+                  </tr></thead>
+                  <tbody>
+                    {EXCLUSION_CODES.map((ec, i) => (
+                      <tr key={ec.code} style={{ borderBottom: `1px solid #141e30`, background: i % 2 === 0 ? "transparent" : "#0d1220" }}>
+                        <td style={{ padding: "8px 12px", color: C.amber, fontWeight: 600 }}>{ec.code}</td>
+                        <td style={{ padding: "8px 12px", color: C.bright }}>{ec.name}</td>
+                        <td style={{ padding: "8px 12px", color: C.blue }}>{ec.desc}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
             )}
           </div>
@@ -561,103 +451,28 @@ AS (
       );
     }
 
-    // ─── Sub-components ───
-    function Label({ children }) {
+    function Label({ children }) { return <label style={{ display: "block", fontSize: 10, fontWeight: 700, color: "#5a7a9a", textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 4 }}>{children}</label>; }
+    function Input(props) { return <input {...props} style={{ padding: "8px 12px", background: "#0a0e17", border: "1px solid #1e2d4a", borderRadius: 4, color: "#c8d6e5", fontSize: 12, fontFamily: "inherit", outline: "none", width: "100%", boxSizing: "border-box", ...props.style }} />; }
+    function Hint({ children }) { return <p style={{ margin: "4px 0 0", fontSize: 10, color: "#4a6a8a", lineHeight: 1.4 }}>{children}</p>; }
+    function Pill({ children, active, onClick, wide }) { return <button onClick={onClick} style={{ padding: wide ? "6px 12px" : "6px 14px", background: active ? "#1a2744" : "transparent", color: active ? "#e8f0fe" : "#4a6a8a", border: `1px solid ${active ? "#2a4a6a" : "#1e2d4a"}`, borderRadius: 4, cursor: "pointer", fontSize: 11, fontWeight: 600, fontFamily: "inherit", textAlign: "left", flex: wide ? "1 1 100%" : undefined, transition: "all 0.15s" }}>{children}</button>; }
+    function Code({ children }) { return <pre style={{ background: "#0a0e17", border: "1px solid #141e30", borderRadius: 4, padding: "10px 14px", margin: "8px 0", fontSize: 11, lineHeight: 1.6, color: "#8ab4d8", overflow: "auto", whiteSpace: "pre-wrap" }}>{children}</pre>; }
+    function RCard({ title, status, children }) {
+      const m = { verified: { b: "#1a4a1a", c: "#75e6a0", bg: "#0f2f0f", t: "VERIFIED" }, warning: { b: "#4a3a1a", c: "#e6c875", bg: "#2f2a0f", t: "CAUTION" }, fix: { b: "#4a1a1a", c: "#e67575", bg: "#2f0f0f", t: "PRODUCTION FIX" } };
+      const s = m[status] || m.verified;
       return (
-        <label style={{
-          fontSize: 10, fontWeight: 700, color: "#5a7a9a",
-          textTransform: "uppercase", letterSpacing: "0.1em",
-        }}>{children}</label>
-      );
-    }
-
-    function Input({ ...props }) {
-      return (
-        <input {...props} style={{
-          padding: "8px 12px",
-          background: "#0a0e17",
-          border: "1px solid #1e2d4a",
-          borderRadius: 4,
-          color: "#c8d6e5",
-          fontSize: 12,
-          fontFamily: "inherit",
-          outline: "none",
-          width: "100%",
-          boxSizing: "border-box",
-          ...props.style,
-        }} />
-      );
-    }
-
-    function Pill({ children, active, onClick, wide }) {
-      return (
-        <button onClick={onClick} style={{
-          padding: wide ? "6px 12px" : "6px 14px",
-          background: active ? "#1a2744" : "transparent",
-          color: active ? "#e8f0fe" : "#4a6a8a",
-          border: `1px solid ${active ? "#2a4a6a" : "#1e2d4a"}`,
-          borderRadius: 4,
-          cursor: "pointer",
-          fontSize: 11,
-          fontWeight: 600,
-          fontFamily: "inherit",
-          textAlign: "left",
-          flex: wide ? "1 1 100%" : undefined,
-          transition: "all 0.15s ease",
-        }}>{children}</button>
-      );
-    }
-
-    function ResearchCard({ title, status, children }) {
-      const colors = {
-        verified: { bg: "#0a1f0a", border: "#1a4a1a", badge: "#75e6a0", badgeBg: "#0f2f0f", text: "VERIFIED" },
-        warning: { bg: "#1f1a0a", border: "#4a3a1a", badge: "#e6c875", badgeBg: "#2f2a0f", text: "CAVEATS" },
-      };
-      const c = colors[status] || colors.verified;
-      return (
-        <div style={{
-          background: "#0f1729",
-          border: `1px solid ${c.border}`,
-          borderRadius: 8,
-          padding: 20,
-          fontSize: 13,
-          lineHeight: 1.8,
-          color: "#a0b8d0",
-        }}>
+        <div className="rc" style={{ background: "#0f1729", border: `1px solid ${s.b}`, borderRadius: 8, padding: 20, fontSize: 13, lineHeight: 1.8, color: "#a0b8d0", marginBottom: 16 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
             <h3 style={{ margin: 0, fontSize: 14, color: "#e8f0fe", fontWeight: 700 }}>{title}</h3>
-            <span style={{
-              padding: "2px 8px", borderRadius: 3, fontSize: 9, fontWeight: 800,
-              background: c.badgeBg, color: c.badge, letterSpacing: "0.1em",
-            }}>{c.text}</span>
+            <span style={{ padding: "2px 8px", borderRadius: 3, fontSize: 9, fontWeight: 800, background: s.bg, color: s.c, letterSpacing: "0.1em" }}>{s.t}</span>
           </div>
-          <div style={{ "& code": { background: "#0a0e17", padding: "1px 5px", borderRadius: 3 } }}>
-            {children}
-          </div>
+          {children}
+          <style>{`.rc p{margin:6px 0}.rc code{background:#0a0e17;padding:1px 5px;border-radius:3px;font-size:11.5px;color:#8ab4d8}.rc strong{color:#c8dce8}`}</style>
         </div>
       );
     }
 
-    function Code({ children }) {
-      return (
-        <pre style={{
-          background: "#0a0e17",
-          border: "1px solid #141e30",
-          borderRadius: 4,
-          padding: "10px 14px",
-          margin: "8px 0",
-          fontSize: 11,
-          lineHeight: 1.6,
-          color: "#8ab4d8",
-          overflow: "auto",
-          whiteSpace: "pre-wrap",
-        }}>{children}</pre>
-      );
-    }
-
-    // ─── RENDER ───
     const root = ReactDOM.createRoot(document.getElementById('root'));
-    root.render(<AJOQueryGenerator />);
+    root.render(<App />);
   </script>
 </body>
 </html>
